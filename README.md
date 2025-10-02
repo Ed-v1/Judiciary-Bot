@@ -1,2 +1,2 @@
 # Judiciary-Bot
-A bot for handling Simdemocracy's lower court docket
+A Discord bot for managing [Simdemocracy's](https://www.reddit.com/r/SimDemocracy/) lower court docket.
