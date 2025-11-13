@@ -1,0 +1,22 @@
+# Python virtual environments
+venv/
+env/
+.venv/
+
+# Environment variables
+.env
+
+# Credentials
+service_account.json
+
+# Cache or compiled files
+__pycache__/
+*.pyc
+
+
+config.yaml
+
+
+Todo.txt
+test.py
+.data/
