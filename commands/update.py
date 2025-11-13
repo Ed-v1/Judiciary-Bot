@@ -256,13 +256,110 @@ class ActionView(View):
             await interaction.response.edit_message(embed=embed, view=new_view)
 
 
+    async def _handle_edit_case(self, interaction: discord.Interaction) -> str:
+        """Open modal to edit case name/number."""
+        modal = EditCaseModal(self.case, self)
+        await interaction.response.send_modal(modal)
+        return ""  # Modal handles refresh
+
+    async def _handle_reassign_case(self, interaction: discord.Interaction, user: discord.User, loop) -> str:
+        """Reassign case to a judge and update local data."""
+        log(f"Reassigning case {self.case['case_number']} by {user}")
+        await interaction.response.defer()
+
+        update_notify = {
+            'origin_channel': getattr(self, 'origin_channel', None),
+            'origin_message_id': getattr(self, 'origin_message_id', None),
+            'initiator_id': getattr(self, 'initiator_id', None)
+        }
+        old_judge = self.case.get('judge', 'N/A')
+        await assign_case(self.bot, self.case['case_number'], update_notify=update_notify)
+
+        case_result = await loop.run_in_executor(None, get_case_info_from_number, self.case.get('case_number'))
+        new_judge = None
+
+        if case_result.get('success'):
+            new_judge = case_result.get('judge')
+            self.case.update({
+                'case_name': case_result.get('case_name') or self.case.get('case_name'),
+                'case_number': case_result.get('case_number') or self.case.get('case_number'),
+                'case_status': case_result.get('case_status') or self.case.get('case_status'),
+                'judge': new_judge or self.case.get('judge'),
+                'filing_link': case_result.get('link') or self.case.get('filing_link')
+            })
+        else:
+            # Fallback: re-scan all cases to find this one
+            all_cases_result = await loop.run_in_executor(None, get_all_cases)
+            if all_cases_result.get('success'):
+                match_case = next((c for c in all_cases_result.get('cases', [])
+                                 if c.get('case_number') == self.case.get('case_number')), None)
+                if match_case:
+                    new_judge = match_case.get('judge')
+                    self.case.update({
+                        'case_name': match_case.get('case_name') or self.case.get('case_name'),
+                        'case_number': match_case.get('case_number') or self.case.get('case_number'),
+                        'case_status': match_case.get('case_status') or self.case.get('case_status'),
+                        'judge': new_judge or self.case.get('judge'),
+                        'filing_link': match_case.get('filing_link') or self.case.get('filing_link')
+                    })
+
+        if new_judge and new_judge != old_judge:
+            return f"Case reassigned from {old_judge} → {new_judge} by {user.mention}."
+        return f"Case reassignment initiated by {user.mention}."
+
+    async def _handle_toggle_trial(self, interaction: discord.Interaction, user: discord.User, loop) -> str:
+        """Toggle between In Trial and In Pre-Trial."""
+        current_status = (self.case.get('case_status') or "").lower()
+        await interaction.response.defer()
+
+        new_status = "In Pre-Trial" if "in trial" in current_status else "In Trial"
+        log(f"Moving case {self.case['case_number']} to {new_status} by {user}")
+
+        result = await loop.run_in_executor(None, lambda: edit_docket(self.case['case_number'], {"case_status": new_status}))
+
+        if result.get("success"):
+            return f"Case status updated to '{new_status}' by {user.mention}."
+        return f"⚠️ Failed to update case status: {result.get('message')}"
+
+    async def _handle_finish_case(self, interaction: discord.Interaction) -> str:
+        """Open ending selector for finishing case."""
+        view = EndingSelectView(self.case, self)
+        await interaction.response.send_message("Select how the case ended:", view=view, ephemeral=True)
+        try:
+            view.selection_message = await interaction.original_response()
+        except Exception:
+            view.selection_message = None
+        return ""  # Modal handles refresh
+
+    async def _handle_close_dialog(self, interaction: discord.Interaction) -> str:
+        """Disable view and gray out embed."""
+        await interaction.response.defer()
+        disabled_view = View(timeout=0)
+        for child in self.children:
+            child.disabled = True
+            disabled_view.add_item(child)
+        embed = create_update_embed(self.case, self.actions)
+        embed.color = discord.Color.light_grey()
+        embed.set_footer(text="This dialog has been closed.")
+        await interaction.message.edit(embed=embed, view=disabled_view)
+        return ""
+
+    async def _handle_delete_case(self, interaction: discord.Interaction, user: discord.User) -> str:
+        """Ask for deletion confirmation."""
+        confirm_view = DeleteConfirmView(self.case, self)
+        await interaction.response.send_message(
+            f"Are you sure you want to permanently delete case `{self.case.get('case_number')}`? This cannot be undone.",
+            view=confirm_view, ephemeral=True
+        )
+        return f"Delete confirmation requested by {user.mention}."
+
     async def button_callback(self, interaction: discord.Interaction):
-        """Generic callback for all buttons."""
+        """Generic callback for all buttons using match/case for clean routing."""
         custom_id = interaction.data["custom_id"]
         user = interaction.user
-        self.bot = interaction.client # Store bot instance
+        self.bot = interaction.client
 
-        # Only the user who initiated the `update` command may interact with this action view
+        # Authorization checks
         if getattr(self, 'initiator_id', None) is not None and user.id != self.initiator_id:
             await interaction.response.send_message("Only the user who started the update can interact with these controls.", ephemeral=True)
             return
@@ -271,120 +368,28 @@ class ActionView(View):
             await interaction.response.send_message("You are not authorized to perform this action.", ephemeral=True)
             return
 
-        if custom_id == "edit_case":
-            modal = EditCaseModal(self.case, self)
-            await interaction.responses.send_modal(modal)
-            return
-
         loop = asyncio.get_event_loop()
         action_log = ""
 
-        if custom_id == "reassign_case":
-            log(f"Reassigning case {self.case['case_number']} by {user}")
-            await interaction.response.defer()
-            # pass origin info so assign_case can notify/update this view's original message when assignment is accepted
-            update_notify = {
-                'origin_channel': getattr(self, 'origin_channel', None),
-                'origin_message_id': getattr(self, 'origin_message_id', None),
-                'initiator_id': getattr(self, 'initiator_id', None)
-            }
-            # Store previous judge for the action log
-            old_judge = self.case.get('judge', 'N/A')
-            
-            # Initiate reassignment
-            await assign_case(self.bot, self.case['case_number'], update_notify=update_notify)
-            
-            # Try to fetch the updated case info after reassignment
-            loop = asyncio.get_event_loop()
-            case_result = await loop.run_in_executor(None, get_case_info_from_number, self.case.get('case_number'))
-            new_judge = None
-            
-            if case_result.get('success'):
-                # update local case using authoritative sheet values
-                try:
-                    new_judge = case_result.get('judge')
-                    self.case.update({
-                        'case_name': case_result.get('case_name') or self.case.get('case_name'),
-                        'case_number': case_result.get('case_number') or self.case.get('case_number'),
-                        'case_status': case_result.get('case_status') or self.case.get('case_status'),
-                        'judge': new_judge or self.case.get('judge'),
-                        'filing_link': case_result.get('link') or self.case.get('filing_link')
-                    })
-                except Exception:
-                    pass
-            else:
-                # Fallback: re-scan all cases by name/number to find any moved row
-                all_cases_result = await loop.run_in_executor(None, get_all_cases)
-                if all_cases_result.get('success'):
-                    
-                    match = next((c for c in all_cases_result.get('cases', []) if c.get('case_name') == self.case.get('case_name') or c.get('case_number') == self.case.get('case_number')), None)
-                    if match:
-                        try:
-                            new_judge = match.get('judge')
-                            self.case.update({
-                                'case_name': match.get('case_name') or self.case.get('case_name'),
-                                'case_number': match.get('case_number') or self.case.get('case_number'),
-                                'case_status': match.get('case_status') or self.case.get('case_status'),
-                                'judge': new_judge or self.case.get('judge'),
-                                'filing_link': match.get('link') or match.get('filing_link') or self.case.get('filing_link')
-                            })
-                        except Exception:
-                            pass
-
-            # Create an informative action log that shows the judge change
-            if new_judge and new_judge != old_judge:
-                action_log = f"Case reassigned from {old_judge} → {new_judge} by {user.mention}."
-            else:
-                action_log = f"Case reassignment initiated by {user.mention}."
-
-        elif custom_id == "toggle_trial":
-            # Toggle between In Trial and In Pre-Trial
-            current_status = (self.case.get('case_status') or "").lower()
-            await interaction.response.defer()
-            if "in trial" in current_status:
-                update_fields = {"case_status": "In Pre-Trial"}
-                log(f"Moving case {self.case['case_number']} to Pre-Trial by {user}")
-            else:
-                update_fields = {"case_status": "In Trial"}
-                log(f"Moving case {self.case['case_number']} to Trial by {user}")
-
-            result = await loop.run_in_executor(None, lambda: edit_docket(self.case['case_number'], update_fields))
-            if result.get("success"):
-                action_log = f"Case status updated to '{update_fields['case_status']}' by {user.mention}."
-            else:
-                action_log = f"⚠️ Failed to update case status: {result.get('message')}"
-
-        elif custom_id == "finish_case":
-            # Open a dropdown View to select the case ending, then collect optional link
-            view = EndingSelectView(self.case, self)
-            # send ephemeral selection and keep it deletable by the select callback
-            await interaction.response.send_message("Select how the case ended:", view=view, ephemeral=True)
-            try:
-                # attach the original ephemeral message to the view so it can be removed later
-                sel_msg = await interaction.original_response()
-                view.selection_message = sel_msg
-            except Exception:
-                view.selection_message = None
-            return
-
-        elif custom_id == "close_dialog":
-            await interaction.response.defer()
-            # Create a disabled gray view with action history preserved
-            disabled_view = View(timeout=0)
-            for child in self.children:
-                child.disabled = True
-                disabled_view.add_item(child)
-            embed = create_update_embed(self.case, self.actions)
-            embed.color = discord.Color.light_grey()
-            embed.set_footer(text="This dialog has been closed.")
-            await interaction.message.edit(embed=embed, view=disabled_view)
-            return
-
-        elif custom_id == "delete_case":
-            # Ask for confirmation before deleting
-            confirm_view = DeleteConfirmView(self.case, self)
-            await interaction.response.send_message(f"Are you sure you want to permanently delete case `{self.case.get('case_number')}`? This cannot be undone.", view=confirm_view, ephemeral=True)
-            action_log = f"Delete confirmation requested by {user.mention}."
+        match custom_id:
+            case "edit_case":
+                await self._handle_edit_case(interaction)
+                return
+            case "reassign_case":
+                action_log = await self._handle_reassign_case(interaction, user, loop)
+            case "toggle_trial":
+                action_log = await self._handle_toggle_trial(interaction, user, loop)
+            case "finish_case":
+                await self._handle_finish_case(interaction)
+                return
+            case "close_dialog":
+                await self._handle_close_dialog(interaction)
+                return
+            case "delete_case":
+                action_log = await self._handle_delete_case(interaction, user)
+            case _:
+                log(f"Unknown button custom_id: {custom_id}")
+                return
 
         await self.refresh_view(interaction, action_log, fetch=True)
 
