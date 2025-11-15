@@ -3,7 +3,8 @@ from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 import re, datetime
 from services.ai_requests import get_case_type
-import yaml
+import yaml, json
+from utils.logger import log
 
 
 with open("./config.yaml", "r") as f:
@@ -11,13 +12,12 @@ with open("./config.yaml", "r") as f:
 
 # Docs
 SCOPES = ['https://www.googleapis.com/auth/documents.readonly']
-SERVICE_ACCOUNT_FILE = 'service_account.json'
+SERVICE_ACCOUNT_FILE = "./data/service_account2.json"
 
 
 
 SHEET_ID = config['google']['sheet_id']
 PENDING_CASES_RANGE = config['google']['pending_cases_tab_range']
-
 
 CASE_LOG_RANGE_CIVIL = config['google'].get('case_log_tab_range_for_civil')
 CASE_LOG_RANGE_CRIMINAL = config['google'].get('case_log_tab_range_for_criminal')
@@ -397,7 +397,6 @@ def increment_available_case_number(case_type: str) -> bool:
 
     except Exception as e:
         raise Exception(f"Error incrementing available case number: {e}")
-# ...existing code...
 
 
 
@@ -477,10 +476,6 @@ def get_gdoccase_info(link: str) -> dict:
 
 
 
-
-
-
-# ...existing code...
 def get_case_info_from_number(case_number: str) -> dict:
     """
     Look up a case by case_number in the docket sheet and return a structured dict.
@@ -895,3 +890,135 @@ def finish_case(case_info: dict) -> dict:
 
     except Exception as e:
         return {"success": False, "message": f"Error finishing case: {e}"}
+
+
+def get_judges(refresh: bool = True) -> dict:
+    """
+    function to pull all judges from the docket sheet.
+    judge data is in the "Data" tab. 
+    Judges names START in A3 and go all the way down.
+    Judge status is in B3 and goes all the way down, they are either "Valid" or "Not"
+    Case taking availability start in C3 and goes all the way down, they are either "Active" or "Unavailable"
+
+    Their discord ID is in K3 and goes all the way down.
+
+    the function will return a dict with all the judges and their info.
+    it will only include judges which their judge status is "Valid"
+    
+    """
+    try:
+
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES_SHEETS
+        )
+        service = build("sheets", "v4", credentials=creds)
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range="Data!A3:K"
+        ).execute()
+        values = result.get("values", [])
+        if not values:
+            return {"success": True, "judges": [], "message": "No judge data found in the sheet."}
+        
+
+
+
+        judges = []
+        for row in values:
+            judge_name = row[0] if len(row) > 0 else ""
+            judge_status = row[1] if len(row) > 1 else ""
+            case_availability = row[2] if len(row) > 2 else ""
+            discord_id = row[10] if len(row) > 10 else ""
+
+            if judge_status.strip().lower() == "valid":
+                judges.append({
+                    "judge_name": judge_name,
+                    "judge_status": judge_status,
+                    "case_availability": case_availability,
+                    "discord_id": discord_id
+                })
+
+        if not refresh:
+            pass
+
+        if refresh:
+            with open("./data/judge_data.json", "w") as f:
+                f.truncate(0)
+                json.dump(judges, f, indent=4)
+
+            # also update judge list in config.yaml in ../config.yaml
+            # the judges list are in "judges_ids" under nothing. it looks like "judges_ids : []"
+            with open("./config.yaml", "r") as f:
+                config = yaml.safe_load(f)
+
+            config["judges_ids"] = [j["discord_id"] for j in judges if j["discord_id"]]
+
+            with open("./config.yaml", "w") as f:
+                yaml.dump(config, f)
+
+
+        return {"success": True, "judges": judges}
+
+    except Exception as e:
+        return {"success": False, "judges": [], "message": f"Error retrieving judges: {e}"}
+    
+
+
+
+def toggle_judge_activity_status(judge, activity_status) -> dict:
+    """
+    Will take in judge name with "Active" or "Unavailable" and update the judge status in the google sheet.
+    """
+
+    # get_judges()
+
+    try:
+        # check if actvity status passed is valid
+
+        if activity_status.strip().lower() not in ["active", "unavailable"]:
+            return {"success": False, "message": "Invalid activity status. Must be 'Active' or 'Unavailable'."}
+        
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES_SHEETS
+        )
+        service = build("sheets", "v4", credentials=creds)
+
+        # Read data from configured data range (skips headers)
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range="Data!A3:C"
+        ).execute()
+
+        values = result.get("values", [])
+        if not values:
+            return {"success": False, "message": "No data found in the sheet."}
+
+        row_index_to_update = -1
+        # find matching row and compute 0-based sheet index for update
+        for offset, row in enumerate(values):
+            sheet_row = 3 + offset  # since we started at A3
+            if len(row) <= 0:
+                continue
+            if (row[0] or "").strip().lower() == judge.strip().lower():
+                row_index_to_update = sheet_row
+                break
+
+        if row_index_to_update == -1:
+            return {
+                "success": False,
+                "message": f"Judge with name '{judge}' not found."
+            }
+
+        row_to_edit_range = f"Data!C{row_index_to_update}"
+        body = {"values": [[activity_status]]}
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=row_to_edit_range,
+            valueInputOption="USER_ENTERED",
+            body=body
+        ).execute()
+
+        return {"success": True, "message": f"Updated judge '{judge}' activity status to '{activity_status}'."}
+
+    except Exception as e:
+        return {"success": False, "message": f"Error updating judge activity status: {e}"}

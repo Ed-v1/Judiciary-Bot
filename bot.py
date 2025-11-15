@@ -5,7 +5,6 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-
 # ---- Load Environment ----
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -42,6 +41,9 @@ async def on_ready():
     print(f"Connected to {len(bot.guilds)} guild(s):")
     for guild in bot.guilds:
         print(f" - {guild.name} (ID: {guild.id})")
+
+    from commands.docket_entry import DocketEntry
+    await bot.add_cog(DocketEntry(bot))
     print("=" * 40)
 
 async def main():
@@ -53,6 +55,7 @@ async def main():
             print(f"Skipped {ext}: {e}")
 
     await bot.start(TOKEN)
+    print("=" * 40)
 
 if __name__ == "__main__":
     try:
